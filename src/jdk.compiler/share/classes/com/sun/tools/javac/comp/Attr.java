@@ -1039,6 +1039,11 @@ public class Attr extends JCTree.Visitor {
                 attribStat(l.head, localEnv);
             }
 
+            // Attribute all bindings.
+            for (List<JCVariableDecl> l = tree.bindings; l != null && l.nonEmpty(); l = l.tail) {
+                attribStat(l.head, localEnv);
+            }
+
             chk.checkVarargsMethodDecl(localEnv, tree);
 
             // Check that type parameters are well-formed.
@@ -1149,6 +1154,39 @@ public class Attr extends JCTree.Visitor {
                         }
                     }
                 }
+
+                if (tree.sym.isDeconstructor()) {
+                    boolean isImplicitCanonicalDeconstructor = true;
+                    List<? extends RecordComponent> recordComponents = env.enclClass.sym.getRecordComponents();
+                    List<Type> recordFieldTypes = TreeInfo.recordFields(env.enclClass).map(vd -> vd.sym.type);
+
+                    if (recordComponents.size() == tree.bindings.size()) {
+                        for (JCVariableDecl param : tree.bindings) {
+                            boolean paramIsVarArgs = (param.sym.flags_field & VARARGS) != 0;
+                            if (!types.isSameType(param.type, recordFieldTypes.head) ||
+                                    (recordComponents.head.isVarargs() != paramIsVarArgs)) {
+                                isImplicitCanonicalDeconstructor = false;
+                                break;
+                            }
+                            recordComponents = recordComponents.tail;
+                            recordFieldTypes = recordFieldTypes.tail;
+                        }
+                    } else {
+                        isImplicitCanonicalDeconstructor = false;
+                    }
+                    if (isImplicitCanonicalDeconstructor) {
+                        log.error(tree, Errors.InvalidCanonicalDeconstructorInRecord(
+                                env.enclClass.sym.name));
+                    }
+                }
+            }
+
+            if (m.isPattern() && tree.thrown.nonEmpty()) {
+                log.error(tree.pos(), Errors.PatternDeclarationCantThrowException);
+            }
+
+            if (m.isDeconstructor()) {
+                m.patternFlags.add(PatternFlags.DECONSTRUCTOR);
             }
 
             // annotation method checks
@@ -1184,7 +1222,7 @@ public class Attr extends JCTree.Visitor {
                 if (isDefaultMethod || (tree.sym.flags() & (ABSTRACT | NATIVE)) == 0)
                     log.error(tree.pos(), Errors.MissingMethBodyOrDeclAbstract);
             } else {
-                if ((tree.sym.flags() & (ABSTRACT|DEFAULT|PRIVATE)) == ABSTRACT) {
+                if ((tree.sym.flags() & (ABSTRACT|DEFAULT|PRIVATE)) == ABSTRACT && !m.isPattern()) {
                     if ((owner.flags() & INTERFACE) != 0) {
                         log.error(tree.body.pos(), Errors.IntfMethCantHaveBody);
                     } else {
@@ -2371,6 +2409,36 @@ public class Attr extends JCTree.Visitor {
         result = null;
     }
 
+    public void visitMatch(JCMatch tree) {
+        Env<AttrContext> localEnv = env.dup(tree, env.info.dup());
+        tree.meth = localEnv.enclMethod;
+
+        List<Type> bindingTypes = tree.meth.sym.type.getBindingTypes();
+        List<JCExpression>   args = tree.args;
+
+        if (!tree.meth.sym.isPattern()) {
+            log.error(tree.pos(), Errors.MatchOutsidePatternDeclaration);
+            return;
+        }
+
+        if (bindingTypes.size() != args.size()) {
+            log.error(tree.pos(), Errors.MatchNotMatchingPatternDeclarationSignature);
+        }
+
+        while (bindingTypes.nonEmpty() && args.nonEmpty()) {
+            attribExpr(args.head, localEnv, bindingTypes.head);
+
+            bindingTypes = bindingTypes.tail;
+            args = args.tail;
+        }
+
+        if (tree.clazz != tree.meth.name) {
+            log.error(tree.pos(), Errors.MatchPatternNameWrong);
+        }
+
+        result = null;
+    }
+
     public void visitContinue(JCContinue tree) {
         tree.target = findJumpTarget(tree.pos(), tree.getTag(), tree.label, env);
         result = null;
@@ -2478,9 +2546,12 @@ public class Attr extends JCTree.Visitor {
         }
 
     public void visitReturn(JCReturn tree) {
-        // Check that there is an enclosing method which is
-        // nested within than the enclosing class.
-        if (env.info.returnResult == null) {
+        // Check that there is an enclosing method (not a pattern declaration)
+        // which is nested within than the enclosing class.
+        if (env.enclMethod != null && env.info.returnResult != null && env.enclMethod.sym.isPattern()) {
+            log.error(tree.pos(), Errors.RetOutsideMeth);
+        }
+        else if (env.info.returnResult == null) {
             log.error(tree.pos(), Errors.RetOutsideMeth);
         } else if (env.info.yieldResult != null) {
             log.error(tree.pos(), Errors.ReturnOutsideSwitchExpression);
@@ -2513,7 +2584,11 @@ public class Attr extends JCTree.Visitor {
 
     public void visitThrow(JCThrow tree) {
         Type owntype = attribExpr(tree.expr, env, Type.noType);
-        chk.checkType(tree, owntype, syms.throwableType);
+        if (env.info.returnResult != null && env.enclMethod !=null && env.enclMethod.sym.isPattern()) {
+            log.error(tree.pos(), Errors.PatternDeclarationNoThrows);
+        } else {
+            chk.checkType(tree, owntype, syms.throwableType);
+        }
         result = null;
     }
 
@@ -4261,22 +4336,47 @@ public class Attr extends JCTree.Visitor {
             site = types.capture(tree.type);
         }
 
-        List<Type> expectedRecordTypes;
-        if (site.tsym.kind == Kind.TYP && ((ClassSymbol) site.tsym).isRecord()) {
-            ClassSymbol record = (ClassSymbol) site.tsym;
-            expectedRecordTypes = record.getRecordComponents()
-                                        .stream()
-                                        .map(rc -> types.memberType(site, rc))
-                                        .map(t -> types.upward(t, types.captures(t)).baseType())
-                                        .collect(List.collector());
-            tree.record = record;
-        } else {
-            log.error(tree.pos(), Errors.DeconstructionPatternOnlyRecords(site.tsym));
+        List<Type> expectedRecordTypes = null;
+
+        if (site.tsym.kind == Kind.TYP) {
+            int nestedPatternCount = tree.nested.size();
+
+            List<MethodSymbol> patternDeclarations = getPatternDeclarationCandidates(site, nestedPatternCount);
+
+            if (patternDeclarations.size() >= 1) {
+                MethodSymbol patternDeclaration = null;
+
+                if (patternDeclarations.size() > 1) {
+                    // precalculate types of pattern components (as in method invocation)
+                    ListBuffer<Type> patternTypesBuffer = new ListBuffer<>();
+                    for (JCTree arg : tree.nested.map(p -> p.getTree())) {
+                        Type argtype = chk.checkNonVoid(arg, attribTree(arg, env, resultInfo));
+                        patternTypesBuffer.append(argtype);
+                    }
+                    List<Type> patternTypes = patternTypesBuffer.toList();
+
+                    patternDeclaration = selectBestPatternDeclarationInScope(tree, site, patternDeclarations, patternTypes);
+                } else {
+                    patternDeclaration = patternDeclarations.getFirst();
+                }
+
+                if (patternDeclaration != null) {
+                    expectedRecordTypes = types.memberType(site, patternDeclaration).getBindingTypes();
+                    tree.patternDeclaration = patternDeclaration;
+                }
+            }
+        }
+
+        if (expectedRecordTypes == null) {
+            log.error(tree.pos(), Errors.CantApplyDeconstructionPattern(site.tsym));
             expectedRecordTypes = Stream.generate(() -> types.createErrorType(tree.type))
                                 .limit(tree.nested.size())
                                 .collect(List.collector());
             tree.record = syms.errSymbol;
+        } else {
+            tree.fullComponentTypes = expectedRecordTypes;
         }
+
         ListBuffer<BindingSymbol> outBindings = new ListBuffer<>();
         List<Type> recordTypes = expectedRecordTypes;
         List<JCPattern> nestedPatterns = tree.nested;
@@ -4290,23 +4390,110 @@ public class Attr extends JCTree.Visitor {
                 nestedPatterns = nestedPatterns.tail;
                 recordTypes = recordTypes.tail;
             }
-            if (recordTypes.nonEmpty() || nestedPatterns.nonEmpty()) {
-                while (nestedPatterns.nonEmpty()) {
-                    attribExpr(nestedPatterns.head, localEnv, Type.noType);
-                    nestedPatterns = nestedPatterns.tail;
-                }
-                List<Type> nestedTypes =
-                        tree.nested.stream().map(p -> p.type).collect(List.collector());
-                log.error(tree.pos(),
-                          Errors.IncorrectNumberOfNestedPatterns(expectedRecordTypes,
-                                                                 nestedTypes));
-            }
         } finally {
             localEnv.info.scope.leave();
         }
         chk.validate(tree.deconstructor, env, true);
         result = tree.type;
         matchBindings = new MatchBindings(outBindings.toList(), List.nil());
+    }
+
+    private MethodSymbol selectBestPatternDeclarationInScope(JCRecordPattern tree,
+                                                           Type site,
+                                                           List<MethodSymbol> patternDeclarations,
+                                                           List<Type> patternTypes) {
+        List<Type> expectedRecordTypes = null;
+        ListBuffer<Integer> score = new ListBuffer<Integer>();
+
+        ArrayList<List<Type>> typesMatrix = new ArrayList<>();
+        for (int j = 0; j < patternDeclarations.size(); j++) {
+            MethodSymbol matcher = patternDeclarations.get(j);
+
+            List<Type> matcherComponentTypes = matcher.bindings()
+                    .stream()
+                    .map(rc -> types.memberType(site, rc))
+                    .map(t -> types.upward(t, types.captures(t)).baseType())
+                    .collect(List.collector());
+
+            typesMatrix.add(matcherComponentTypes);
+        }
+
+        int selected = -1;
+        boolean atLeastOne = false;
+        for (int n = 0; n < patternDeclarations.size(); n++) {
+            List<Type> matcherComponentTypes = typesMatrix.get(n);
+            boolean applicable = true;
+
+            for (int i = 0; applicable && i < patternTypes.size(); i++) {
+                applicable &= types.isCastable(patternTypes.get(i), matcherComponentTypes.get(i));
+            }
+
+            if (applicable) {
+                boolean found = true;
+                atLeastOne = true;
+                // for all pattern components
+                for (int i = 0; found && i < patternTypes.size(); i++) {
+                    if (!types.isSameType(patternTypes.get(i), matcherComponentTypes.get(i)) &&
+                            !sameBindingTypeInAllCandidateDtors(typesMatrix, n, i, matcherComponentTypes)) {
+                        found = false;
+                    }
+                }
+                if (found && selected < 0) {
+                    selected = n;
+                }
+            }
+
+            applicable = true;
+        }
+
+        if (atLeastOne && selected < 0) {
+            log.error(tree.pos(),
+                    Errors.MatcherOverloadingAmbiguity);
+            return null;
+        } else if (!atLeastOne) {
+            log.error(tree.pos(),
+                    Errors.NoCompatibleMatcherFound);
+            return null;
+        }
+
+        return patternDeclarations.get(selected);
+    }
+
+    private boolean sameBindingTypeInAllCandidateDtors(ArrayList<List<Type>> typesMatrix, int n, int i, List<Type> matcherComponentTypes) {
+        boolean allSame = true;
+        for (int n_prime = 0; n_prime < typesMatrix.size(); n_prime++) {
+            if (n_prime != n) {
+                allSame &= types.isSameType(typesMatrix.get(n_prime).get(i), matcherComponentTypes.get(i));
+            }
+        }
+        return allSame;
+    }
+
+    private List<MethodSymbol> getPatternDeclarationCandidates(Type site, int nestedPatternCount) {
+        var matchersIt = site.tsym.members()
+                .getSymbols(sym -> sym.isPattern() && sym.type.getBindingTypes().size() == nestedPatternCount)
+                .iterator();
+        List<MethodSymbol> patternDeclarations = Stream.generate(() -> null)
+                .takeWhile(x -> matchersIt.hasNext())
+                .map(n -> (MethodSymbol) matchersIt.next())
+                .collect(List.collector());
+
+        if (((ClassSymbol) site.tsym).isRecord()) {
+            ClassSymbol record = (ClassSymbol) site.tsym;
+
+            if (record.getRecordComponents().size() == nestedPatternCount) {
+                List<Type> recordComponents = record.getRecordComponents()
+                        .stream()
+                        .map(rc -> rc.type)
+                        .collect(List.collector());
+
+                MethodType mt = new MethodType(List.nil(), syms.voidType, List.nil(), syms.methodClass);
+                mt.bindingtypes = recordComponents;
+                patternDeclarations = patternDeclarations.prepend(new MethodSymbol(PUBLIC | SYNTHETIC, ((ClassSymbol) site.tsym).name, mt, site.tsym));
+            }
+        }
+
+        return patternDeclarations;
     }
 
     public void visitIndexed(JCArrayAccess tree) {
